@@ -1,0 +1,27 @@
+# Runtime data (stored in /tmp by default, but in case paths are changed)
+/tmp/claude-subagent-*
+*.out
+*.log
+
+# Results and registry
+results/
+registry/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Test artifacts
+*.test.sh.out
