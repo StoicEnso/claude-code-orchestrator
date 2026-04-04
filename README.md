@@ -146,7 +146,7 @@ Returns immediately. Claude Code runs in background.
 
 ---
 
-### `poll` — Check task status
+### `poll` — Check task status and refresh from output/stream
 
 ```bash
 cc-orchestrator poll <task-id>
@@ -161,7 +161,7 @@ Returns task metadata including `status`:
 
 ---
 
-### `result` — Get full output
+### `result` — Get full output / text
 
 ```bash
 cc-orchestrator result <task-id>
@@ -260,6 +260,26 @@ By task:
 ```
 
 ---
+
+
+### `watch` — Tail live progress
+```bash
+{baseDir}/scripts/cc-orchestrator.sh watch <task-id>
+```
+
+### `batch` — Dispatch multiple tasks from a manifest
+```bash
+{baseDir}/scripts/cc-orchestrator.sh batch <manifest.jsonl> [--max-parallel N]
+```
+
+### Notifications
+`dispatch` and `resume` accept `--notify-cmd "shell command"` and export:
+- `CC_NOTIFY_TASK_ID`
+- `CC_NOTIFY_STATUS`
+- `CC_NOTIFY_COST_USD`
+- `CC_NOTIFY_RESULT_PREVIEW`
+
+Use this for shell/webhook/email hooks.
 
 ### `cleanup` — Remove old data
 

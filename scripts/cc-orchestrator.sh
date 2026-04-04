@@ -4,23 +4,15 @@
 #
 # Commands:
 #   dispatch  — Submit a task, get a handle back immediately
-#   poll      — Check if a task is done
-#   result    — Get the full result of a completed task
+#   poll      — Check current task status + progress
+#   watch     — Tail live progress from the raw stream log
+#   result    — Get the final result (json or text)
 #   resume    — Send a correction/continuation to a task
+#   batch     — Dispatch multiple tasks from a JSONL manifest
 #   list      — Show all tracked tasks
 #   cancel    — Kill a running task
 #   costs     — Show cost summary across all tasks
 #   cleanup   — Archive completed tasks, remove old data
-#
-# Usage:
-#   cc-orchestrator.sh dispatch <workdir> <budget> <model> <label> "<task>"
-#   cc-orchestrator.sh poll <task-id>
-#   cc-orchestrator.sh result <task-id>
-#   cc-orchestrator.sh resume <task-id> <budget> "<follow-up>"
-#   cc-orchestrator.sh list [--running|--done|--failed|--all]
-#   cc-orchestrator.sh cancel <task-id>
-#   cc-orchestrator.sh costs [--today|--all]
-#   cc-orchestrator.sh cleanup
 
 set -euo pipefail
 
@@ -29,14 +21,18 @@ REGISTRY_DIR="/tmp/claude-subagent-registry"
 RESULTS_DIR="/tmp/claude-subagent-results"
 LOGS_DIR="/tmp/claude-subagent-logs"
 COST_LOG="/tmp/claude-subagent-costs.jsonl"
+HOOKS_DIR="/tmp/claude-subagent-hooks"
 
-mkdir -p "$REGISTRY_DIR" "$RESULTS_DIR" "$LOGS_DIR"
+mkdir -p "$REGISTRY_DIR" "$RESULTS_DIR" "$LOGS_DIR" "$HOOKS_DIR"
 
-# ─── helpers ───
+json_escape() {
+  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+}
 
 gen_task_id() {
   local label="${1:-task}"
-  local clean_label=$(echo "$label" | tr ' /' '-' | tr -cd 'a-zA-Z0-9-' | head -c 30)
+  local clean_label
+  clean_label=$(echo "$label" | tr ' /' '-' | tr -cd 'a-zA-Z0-9-' | head -c 30)
   echo "${clean_label}-$(date +%s)-$$"
 }
 
@@ -51,40 +47,199 @@ write_registry() {
   local pid="${8:-}"
   local cost="${9:-0}"
   local result_preview="${10:-}"
-  
-  python3 -c "
-import json, os, time
+  local timeout_secs="${11:-0}"
+  local notify_cmd="${12:-}"
+  local batch_id="${13:-}"
+
+  local label_json preview_json notify_json
+  label_json=$(printf '%s' "$label" | json_escape)
+  preview_json=$(printf '%s' "$result_preview" | json_escape)
+  notify_json=$(printf '%s' "$notify_cmd" | json_escape)
+
+  python3 - "$REGISTRY_DIR/$task_id.json" "$task_id" "$status" "$session_id" "$workdir" "$model" "$budget" "$pid" "$cost" "$timeout_secs" "$batch_id" "$label_json" "$preview_json" "$notify_json" <<'PY'
+import json, os, sys, time
+reg_file, task_id, status, session_id, workdir, model, budget, pid, cost, timeout_secs, batch_id, label_json, preview_json, notify_json = sys.argv[1:15]
 entry = {
-    'task_id': '$task_id',
-    'status': '$status',
-    'session_id': '$session_id',
-    'label': '''$label''',
-    'workdir': '$workdir',
-    'model': '$model',
-    'budget': '$budget',
-    'pid': '$pid',
-    'cost_usd': float('$cost') if '$cost' else 0,
-    'result_preview': '''$result_preview'''[:200],
+    'task_id': task_id,
+    'status': status,
+    'session_id': session_id,
+    'label': json.loads(label_json),
+    'workdir': workdir,
+    'model': model,
+    'budget': budget,
+    'pid': pid,
+    'cost_usd': float(cost) if cost else 0,
+    'result_preview': json.loads(preview_json)[:200],
+    'timeout_secs': int(timeout_secs) if timeout_secs else 0,
+    'notify_cmd': json.loads(notify_json),
+    'batch_id': batch_id,
     'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-    'started_at': time.strftime('%Y-%m-%dT%H:%M:%S%z') if '$status' == 'running' else ''
+    'started_at': time.strftime('%Y-%m-%dT%H:%M:%S%z') if status == 'running' else ''
 }
-# Merge with existing entry if present
-reg_file = '$REGISTRY_DIR/$task_id.json'
 if os.path.exists(reg_file):
     try:
-        with open(reg_file) as f:
+        with open(reg_file, encoding='utf-8') as f:
             existing = json.load(f)
-        existing.update({k: v for k, v in entry.items() if v})
+        existing.update({k: v for k, v in entry.items() if v not in ('', None)})
         entry = existing
-    except: pass
-entry['status'] = '$status'
+    except Exception:
+        pass
+entry['status'] = status
 entry['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
-with open(reg_file, 'w') as f:
+with open(reg_file, 'w', encoding='utf-8') as f:
     json.dump(entry, f, indent=2)
-"
+PY
 }
 
-# ─── dispatch ───
+refresh_from_output_if_ready() {
+  local task_id="$1"
+  local reg_file="$REGISTRY_DIR/${task_id}.json"
+  local out_file="$LOGS_DIR/${task_id}.out"
+  local stream_file="$LOGS_DIR/${task_id}.stream"
+
+  python3 - "$reg_file" "$out_file" "$stream_file" "$COST_LOG" <<'PY'
+import json, os, sys, time
+reg_file, out_file, stream_file, cost_log = sys.argv[1:5]
+try:
+    with open(reg_file, encoding='utf-8') as f:
+        reg = json.load(f)
+except Exception:
+    print('{}')
+    raise SystemExit(0)
+
+updated = False
+
+if reg.get('status') == 'running':
+    if os.path.exists(out_file):
+        try:
+            with open(out_file, encoding='utf-8') as f:
+                d = json.load(f)
+            status_map = {'ok': 'done', 'error': 'failed', 'timeout': 'timeout'}
+            reg['status'] = status_map.get(d.get('status'), reg.get('status'))
+            reg['session_id'] = d.get('session_id', reg.get('session_id', ''))
+            reg['cost_usd'] = d.get('cost_usd', reg.get('cost_usd', 0))
+            reg['result_preview'] = str(d.get('result', reg.get('result_preview', '')))[:200]
+            reg['turns'] = d.get('turns', reg.get('turns', 0))
+            reg['duration_ms'] = d.get('duration_ms', reg.get('duration_ms', 0))
+            reg['result_subtype'] = d.get('result_subtype', reg.get('result_subtype', ''))
+            reg['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+            updated = True
+        except Exception:
+            pass
+    elif os.path.exists(stream_file):
+        session_id = reg.get('session_id', '')
+        assistant_count = 0
+        last_assistant = ''
+        event_count = 0
+        with open(stream_file, encoding='utf-8', errors='replace') as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    continue
+                event_count += 1
+                if event.get('type') == 'system' and event.get('subtype') == 'init' and not session_id:
+                    session_id = event.get('session_id', '')
+                elif event.get('type') == 'assistant':
+                    assistant_count += 1
+                    msg = event.get('message', {})
+                    texts = [b.get('text','') for b in (msg.get('content') or []) if b.get('type') == 'text']
+                    if texts:
+                        last_assistant = '\n\n'.join(texts)[-400:]
+                elif event.get('type') == 'result':
+                    status_map = {'error': 'failed'}
+                    reg['status'] = 'failed' if event.get('is_error') else 'done'
+                    reg['cost_usd'] = event.get('total_cost_usd', reg.get('cost_usd', 0))
+                    reg['turns'] = event.get('num_turns', reg.get('turns', 0))
+                    reg['duration_ms'] = event.get('duration_ms', reg.get('duration_ms', 0))
+                    reg['result_subtype'] = event.get('subtype', reg.get('result_subtype', ''))
+                    if last_assistant:
+                        reg['result_preview'] = last_assistant[:200]
+                    updated = True
+        reg['session_id'] = session_id
+        reg['stream_events'] = event_count
+        reg['assistant_messages'] = assistant_count
+        if last_assistant and not reg.get('result_preview'):
+            reg['result_preview'] = last_assistant[:200]
+        reg['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+        updated = True
+
+if updated:
+    with open(reg_file, 'w', encoding='utf-8') as f:
+        json.dump(reg, f, indent=2)
+print(json.dumps(reg))
+PY
+}
+
+run_notify_hook() {
+  local task_id="$1"
+  local reg_file="$REGISTRY_DIR/${task_id}.json"
+  [ -f "$reg_file" ] || return 0
+
+  local notify_cmd status result_preview cost
+  notify_cmd=$(python3 -c "import json; print(json.load(open('$reg_file')).get('notify_cmd',''))" 2>/dev/null || true)
+  [ -n "$notify_cmd" ] || return 0
+
+  status=$(python3 -c "import json; print(json.load(open('$reg_file')).get('status',''))" 2>/dev/null || true)
+  result_preview=$(python3 -c "import json; print(json.load(open('$reg_file')).get('result_preview',''))" 2>/dev/null || true)
+  cost=$(python3 -c "import json; print(json.load(open('$reg_file')).get('cost_usd',0))" 2>/dev/null || true)
+
+  CC_NOTIFY_TASK_ID="$task_id" \
+  CC_NOTIFY_STATUS="$status" \
+  CC_NOTIFY_COST_USD="$cost" \
+  CC_NOTIFY_RESULT_PREVIEW="$result_preview" \
+  bash -lc "$notify_cmd" > "$HOOKS_DIR/${task_id}.notify.out" 2> "$HOOKS_DIR/${task_id}.notify.err" || true
+}
+
+finish_task_from_output() {
+  local task_id="$1"
+  local exit_code="$2"
+  local reg_file="$REGISTRY_DIR/${task_id}.json"
+  local out_file="$LOGS_DIR/${task_id}.out"
+
+  if [ -f "$out_file" ]; then
+    python3 - "$reg_file" "$out_file" "$COST_LOG" "$exit_code" <<'PY'
+import json, os, sys, time
+reg_file, out_file, cost_log, exit_code = sys.argv[1:5]
+exit_code = int(exit_code)
+with open(out_file, encoding='utf-8') as f:
+    d = json.load(f)
+try:
+    with open(reg_file, encoding='utf-8') as f:
+        entry = json.load(f)
+except Exception:
+    entry = {}
+status_map = {'ok': 'done', 'error': 'failed', 'timeout': 'timeout'}
+status = status_map.get(d.get('status', ''), 'failed' if exit_code else 'done')
+entry.update({
+    'status': status,
+    'session_id': d.get('session_id', entry.get('session_id', '')),
+    'cost_usd': d.get('cost_usd', 0),
+    'result_preview': str(d.get('result', ''))[:200],
+    'turns': d.get('turns', 0),
+    'duration_ms': d.get('duration_ms', 0),
+    'result_subtype': d.get('result_subtype', ''),
+    'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+    'exit_code': d.get('exit_code', exit_code),
+})
+with open(reg_file, 'w', encoding='utf-8') as f:
+    json.dump(entry, f, indent=2)
+with open(cost_log, 'a', encoding='utf-8') as f:
+    f.write(json.dumps({
+        'task_id': entry.get('task_id', ''),
+        'label': entry.get('label', ''),
+        'model': entry.get('model', ''),
+        'cost_usd': entry.get('cost_usd', 0),
+        'status': status,
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z')
+    }) + '\n')
+PY
+  fi
+  run_notify_hook "$task_id"
+}
 
 cmd_dispatch() {
   local workdir="${1:-.}"
@@ -92,351 +247,423 @@ cmd_dispatch() {
   local model="${3:-sonnet}"
   local label="${4:-task}"
   local task="${5:-}"
-  
+  shift 5 || true
+
+  local timeout_secs="0"
+  local notify_cmd=""
+  local batch_id=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout_secs="${2:-0}"; shift 2 ;;
+      --notify-cmd) notify_cmd="${2:-}"; shift 2 ;;
+      --batch-id) batch_id="${2:-}"; shift 2 ;;
+      *) echo "{\"error\": \"Unknown option: $1\"}" >&2; exit 1 ;;
+    esac
+  done
+
   if [ -z "$task" ]; then
     echo '{"error": "No task provided"}' >&2
-    echo "Usage: cc-orchestrator.sh dispatch <workdir> <budget> <model> <label> \"<task>\"" >&2
+    echo "Usage: cc-orchestrator.sh dispatch <workdir> <budget> <model> <label> \"<task>\" [--timeout N] [--notify-cmd CMD]" >&2
     exit 1
   fi
-  
-  local task_id=$(gen_task_id "$label")
-  
-  # Register as running
-  write_registry "$task_id" "running" "" "$label" "$workdir" "$model" "$budget" "" "0" ""
-  
-  # Launch in background
-  (
-    CC_TASK_ID="$task_id" bash "$SCRIPT_DIR/run-task.sh" run "$workdir" "$budget" "$model" "$task" \
-      > "$LOGS_DIR/${task_id}.out" 2>&1
-    
-    EXIT_CODE=$?
-    
-    # Parse result and update registry
-    if [ -f "$LOGS_DIR/${task_id}.out" ]; then
-      python3 -c "
-import json, sys
-try:
-    with open('$LOGS_DIR/${task_id}.out') as f:
-        content = f.read().strip()
-    # Try parsing whole file as JSON first (output is multi-line JSON)
-    d = None
-    try:
-        d = json.loads(content)
-    except:
-        d = None
-    if not d:
-        d = {'status': 'error', 'error': 'no parseable output'}
-    
-    status = 'done' if d.get('status') == 'ok' else 'failed'
-    session_id = d.get('session_id', '')
-    cost = d.get('cost_usd', 0)
-    result = d.get('result', d.get('error', ''))[:200]
-    
-    # Update registry
-    import os, time
-    reg_file = '$REGISTRY_DIR/$task_id.json'
-    if os.path.exists(reg_file):
-        with open(reg_file) as f:
-            entry = json.load(f)
-    else:
-        entry = {}
-    
-    entry.update({
-        'status': status,
-        'session_id': session_id,
-        'cost_usd': cost,
-        'result_preview': result,
-        'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
-        'exit_code': $EXIT_CODE
-    })
-    
-    with open(reg_file, 'w') as f:
-        json.dump(entry, f, indent=2)
-    
-    # Append to cost log
-    cost_entry = {
-        'task_id': '$task_id',
-        'label': entry.get('label', ''),
-        'model': entry.get('model', ''),
-        'cost_usd': cost,
-        'status': status,
-        'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z')
-    }
-    with open('$COST_LOG', 'a') as f:
-        f.write(json.dumps(cost_entry) + '\n')
-        
-except Exception as e:
-    import time
-    reg_file = '$REGISTRY_DIR/$task_id.json'
-    with open(reg_file, 'w') as f:
-        json.dump({'task_id': '$task_id', 'status': 'failed', 'error': str(e), 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}, f)
-" 2>/dev/null
-    fi
-  ) &
-  
-  local bg_pid=$!
-  
-  # Update registry with PID
-  write_registry "$task_id" "running" "" "$label" "$workdir" "$model" "$budget" "$bg_pid" "0" ""
-  
-  # Return the handle immediately
-  echo "{\"task_id\": \"$task_id\", \"pid\": $bg_pid, \"status\": \"dispatched\", \"label\": \"$label\", \"model\": \"$model\", \"budget\": \"$budget\"}"
-}
 
-# ─── poll ───
+  local task_id
+  task_id=$(gen_task_id "$label")
+  write_registry "$task_id" "running" "" "$label" "$workdir" "$model" "$budget" "" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id"
+
+  (
+    CC_TASK_ID="$task_id" \
+    CC_TIMEOUT="$timeout_secs" \
+    CC_STREAM_FILE="$LOGS_DIR/${task_id}.stream" \
+    CC_STDERR_FILE="$LOGS_DIR/${task_id}.stderr" \
+    bash "$SCRIPT_DIR/run-task.sh" run "$workdir" "$budget" "$model" "$task" > "$LOGS_DIR/${task_id}.out"
+    EXIT_CODE=$?
+    finish_task_from_output "$task_id" "$EXIT_CODE"
+  ) &
+
+  local bg_pid=$!
+  write_registry "$task_id" "running" "" "$label" "$workdir" "$model" "$budget" "$bg_pid" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id"
+
+  echo "{\"task_id\": \"$task_id\", \"pid\": $bg_pid, \"status\": \"dispatched\", \"label\": \"$label\", \"model\": \"$model\", \"budget\": \"$budget\", \"timeout_secs\": $timeout_secs}"
+}
 
 cmd_poll() {
   local task_id="${1:-}"
   if [ -z "$task_id" ]; then echo '{"error": "No task_id"}' >&2; exit 1; fi
-  
+
   local reg_file="$REGISTRY_DIR/${task_id}.json"
   if [ ! -f "$reg_file" ]; then
     echo "{\"error\": \"Task not found: $task_id\"}"
     exit 1
   fi
-  
-  python3 -c "
-import json
-with open('$reg_file') as f:
+
+  refresh_from_output_if_ready "$task_id" > /tmp/cc-poll-${task_id}.json
+
+  python3 - "/tmp/cc-poll-${task_id}.json" <<'PY'
+import json, os, sys
+with open(sys.argv[1], encoding='utf-8') as f:
     d = json.load(f)
-# Check if PID is still running
 pid = d.get('pid', '')
 if pid and d.get('status') == 'running':
-    import os
     try:
         os.kill(int(pid), 0)
         d['alive'] = True
-    except:
+    except Exception:
         d['alive'] = False
-        # Process died but registry not updated — check output
-        d['status'] = 'unknown-check-result'
+        if d.get('status') == 'running':
+            d['status'] = 'unknown-check-result'
 print(json.dumps(d, indent=2))
-"
+PY
+  rm -f "/tmp/cc-poll-${task_id}.json"
 }
 
-# ─── result ───
-
-cmd_result() {
+cmd_watch() {
   local task_id="${1:-}"
   if [ -z "$task_id" ]; then echo '{"error": "No task_id"}' >&2; exit 1; fi
-  
-  local out_file="$LOGS_DIR/${task_id}.out"
-  if [ -f "$out_file" ]; then
-    cat "$out_file"
-  else
-    echo "{\"error\": \"No output file for task $task_id\"}"
+  local stream_file="$LOGS_DIR/${task_id}.stream"
+  if [ ! -f "$stream_file" ]; then
+    echo "No stream file yet for $task_id"
+    exit 1
   fi
+
+  tail -n +1 -f "$stream_file" | python3 -c '
+import json, sys
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        event = json.loads(raw)
+    except Exception:
+        continue
+    t = event.get("type")
+    if t == "system" and event.get("subtype") == "init":
+        print(f"[init] session={event.get('"'"'session_id'"'"','"'"''"'"')} model={event.get('"'"'model'"'"','"'"''"'"')}", flush=True)
+    elif t == "assistant":
+        msg = event.get("message", {})
+        texts = [b.get("text","").strip() for b in (msg.get("content") or []) if b.get("type") == "text" and b.get("text","").strip()]
+        if texts:
+            print(f"[assistant] {'"'"' '"'"'.join(texts)}", flush=True)
+        else:
+            print("[assistant] (non-text event)", flush=True)
+    elif t == "result":
+        print(f"[result] subtype={event.get('"'"'subtype'"'"','"'"''"'"')} cost=${event.get('"'"'total_cost_usd'"'"',0):.4f} turns={event.get('"'"'num_turns'"'"',0)} duration_ms={event.get('"'"'duration_ms'"'"',0)}", flush=True)
+    else:
+        print(f"[{t}]", flush=True)
+'
 }
 
-# ─── resume ───
+cmd_result() {
+  local mode="json"
+  if [ "${1:-}" = "--text" ]; then
+    mode="text"
+    shift
+  elif [ "${1:-}" = "--raw" ]; then
+    mode="raw"
+    shift
+  fi
+
+  local task_id="${1:-}"
+  if [ -z "$task_id" ]; then echo '{"error": "No task_id"}' >&2; exit 1; fi
+
+  local out_file="$LOGS_DIR/${task_id}.out"
+  local stream_file="$LOGS_DIR/${task_id}.stream"
+
+  case "$mode" in
+    json)
+      [ -f "$out_file" ] && cat "$out_file" || echo "{\"error\": \"No output file for task $task_id\"}"
+      ;;
+    text)
+      if [ -f "$out_file" ]; then
+        python3 - "$out_file" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as f:
+    d = json.load(f)
+print(d.get('result', ''))
+PY
+      else
+        echo "No output file for task $task_id"
+        exit 1
+      fi
+      ;;
+    raw)
+      [ -f "$stream_file" ] && cat "$stream_file" || echo "{\"error\": \"No stream file for task $task_id\"}"
+      ;;
+  esac
+}
 
 cmd_resume() {
   local task_id="${1:-}"
   local budget="${2:-0.50}"
   local follow_up="${3:-}"
-  
+  shift 3 || true
+
+  local timeout_secs="0"
+  local notify_cmd=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout_secs="${2:-0}"; shift 2 ;;
+      --notify-cmd) notify_cmd="${2:-}"; shift 2 ;;
+      *) echo "{\"error\": \"Unknown option: $1\"}" >&2; exit 1 ;;
+    esac
+  done
+
   if [ -z "$task_id" ] || [ -z "$follow_up" ]; then
     echo '{"error": "Need task_id and follow-up prompt"}' >&2
     exit 1
   fi
-  
+
   local reg_file="$REGISTRY_DIR/${task_id}.json"
   if [ ! -f "$reg_file" ]; then
     echo "{\"error\": \"Task not found: $task_id\"}"
     exit 1
   fi
-  
-  # Get session_id from registry
-  local session_id=$(python3 -c "import json; print(json.load(open('$reg_file')).get('session_id', ''))")
-  
+
+  local session_id label workdir model batch_id
+  session_id=$(python3 -c "import json; print(json.load(open('$reg_file')).get('session_id', ''))")
+  label=$(python3 -c "import json; print(json.load(open('$reg_file')).get('label', 'resume'))")
+  workdir=$(python3 -c "import json; print(json.load(open('$reg_file')).get('workdir', ''))")
+  model=$(python3 -c "import json; print(json.load(open('$reg_file')).get('model', ''))")
+  batch_id=$(python3 -c "import json; print(json.load(open('$reg_file')).get('batch_id', ''))")
+
   if [ -z "$session_id" ]; then
     echo "{\"error\": \"No session_id found for task $task_id — cannot resume\"}"
     exit 1
   fi
-  
+
   local resume_id="${task_id}-r$(date +%s)"
-  
-  # Register the resume
-  local label=$(python3 -c "import json; print(json.load(open('$reg_file')).get('label', 'resume'))")
-  write_registry "$resume_id" "running" "$session_id" "${label}-resume" "" "" "$budget" "" "0" ""
-  
-  # Launch resume in background
+  write_registry "$resume_id" "running" "$session_id" "${label}-resume" "$workdir" "$model" "$budget" "" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id"
+
   (
-    CC_TASK_ID="$resume_id" bash "$SCRIPT_DIR/run-task.sh" resume "$session_id" "$budget" "$follow_up" \
-      > "$LOGS_DIR/${resume_id}.out" 2>&1
-    
-    # Parse and update registry (same as dispatch)
-    python3 -c "
-import json, os, time
-try:
-    with open('$LOGS_DIR/${resume_id}.out') as f:
-        content = f.read().strip()
-    try:
-        d = json.loads(content)
-    except:
-        d = None
-    if not d:
-        d = {'status': 'error', 'error': 'no parseable output'}
-    
-    status = 'done' if d.get('status') == 'ok' else 'failed'
-    reg_file = '$REGISTRY_DIR/$resume_id.json'
-    if os.path.exists(reg_file):
-        with open(reg_file) as f:
-            entry = json.load(f)
-    else:
-        entry = {}
-    
-    entry.update({
+    CC_TASK_ID="$resume_id" \
+    CC_TIMEOUT="$timeout_secs" \
+    CC_STREAM_FILE="$LOGS_DIR/${resume_id}.stream" \
+    CC_STDERR_FILE="$LOGS_DIR/${resume_id}.stderr" \
+    bash "$SCRIPT_DIR/run-task.sh" resume "$session_id" "$budget" "$follow_up" "$workdir" > "$LOGS_DIR/${resume_id}.out"
+    EXIT_CODE=$?
+    python3 - "$REGISTRY_DIR/${resume_id}.json" "$LOGS_DIR/${resume_id}.out" "$COST_LOG" "$task_id" "$EXIT_CODE" <<'PY'
+import json, sys, time
+reg_file, out_file, cost_log, parent_task_id, exit_code = sys.argv[1:6]
+exit_code = int(exit_code)
+with open(out_file, encoding='utf-8') as f:
+    d = json.load(f)
+with open(reg_file, encoding='utf-8') as f:
+    entry = json.load(f)
+status_map = {'ok': 'done', 'error': 'failed', 'timeout': 'timeout'}
+status = status_map.get(d.get('status', ''), 'failed' if exit_code else 'done')
+entry.update({
+    'status': status,
+    'session_id': d.get('session_id', entry.get('session_id', '')),
+    'resumed_from': parent_task_id,
+    'cost_usd': d.get('cost_usd', 0),
+    'result_preview': str(d.get('result', ''))[:200],
+    'turns': d.get('turns', 0),
+    'duration_ms': d.get('duration_ms', 0),
+    'result_subtype': d.get('result_subtype', ''),
+    'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+    'exit_code': d.get('exit_code', exit_code),
+})
+with open(reg_file, 'w', encoding='utf-8') as f:
+    json.dump(entry, f, indent=2)
+with open(cost_log, 'a', encoding='utf-8') as f:
+    f.write(json.dumps({
+        'task_id': entry.get('task_id', ''),
+        'label': entry.get('label', ''),
+        'model': entry.get('model', ''),
+        'cost_usd': entry.get('cost_usd', 0),
         'status': status,
-        'session_id': d.get('session_id', '$session_id'),
-        'resumed_from': '$task_id',
-        'cost_usd': d.get('cost_usd', 0),
-        'result_preview': d.get('result', '')[:200],
-        'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')
-    })
-    with open(reg_file, 'w') as f:
-        json.dump(entry, f, indent=2)
-    
-    with open('$COST_LOG', 'a') as f:
-        f.write(json.dumps({'task_id': '$resume_id', 'label': entry.get('label',''), 'cost_usd': d.get('cost_usd',0), 'status': status, 'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z')}) + '\n')
-except Exception as e:
-    with open('$REGISTRY_DIR/$resume_id.json', 'w') as f:
-        json.dump({'task_id': '$resume_id', 'status': 'failed', 'error': str(e)}, f)
-" 2>/dev/null
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z')
+    }) + '\n')
+PY
+    run_notify_hook "$resume_id"
   ) &
-  
-  echo "{\"task_id\": \"$resume_id\", \"resumed_from\": \"$task_id\", \"session_id\": \"$session_id\", \"pid\": $!, \"status\": \"dispatched\"}"
+
+  local bg_pid=$!
+  write_registry "$resume_id" "running" "$session_id" "${label}-resume" "$workdir" "$model" "$budget" "$bg_pid" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id"
+
+  echo "{\"task_id\": \"$resume_id\", \"resumed_from\": \"$task_id\", \"session_id\": \"$session_id\", \"pid\": $bg_pid, \"status\": \"dispatched\", \"timeout_secs\": $timeout_secs}"
 }
 
-# ─── list ───
+cmd_batch() {
+  local manifest="${1:-}"
+  shift || true
+  local max_parallel="2"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --max-parallel) max_parallel="${2:-2}"; shift 2 ;;
+      *) echo "{\"error\": \"Unknown option: $1\"}" >&2; exit 1 ;;
+    esac
+  done
+
+  [ -n "$manifest" ] || { echo '{"error": "Need manifest path"}' >&2; exit 1; }
+  [ -f "$manifest" ] || { echo "{\"error\": \"Manifest not found: $manifest\"}" >&2; exit 1; }
+
+  local batch_id="batch-$(date +%s)-$$"
+  local tmp_handles="/tmp/${batch_id}.handles"
+  : > "$tmp_handles"
+
+  while IFS= read -r encoded; do
+    [ -n "$encoded" ] || continue
+    eval "$(python3 - "$encoded" <<'PY'
+import base64, json, shlex, sys
+row = json.loads(base64.b64decode(sys.argv[1]).decode())
+for k in ['workdir','budget','model','label','task','timeout']:
+    print(f"{k.upper()}={shlex.quote(str(row.get(k,'')))}")
+PY
+)"
+
+    while true; do
+      local running_count
+      running_count=$(python3 - "$REGISTRY_DIR" "$batch_id" <<'PY'
+import glob, json, os, sys
+reg_dir, batch_id = sys.argv[1:3]
+count = 0
+for path in glob.glob(os.path.join(reg_dir, '*.json')):
+    try:
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f)
+        if d.get('batch_id') == batch_id and d.get('status') == 'running':
+            count += 1
+    except Exception:
+        pass
+print(count)
+PY
+)
+      [ "$running_count" -lt "$max_parallel" ] && break
+      sleep 2
+    done
+
+    if [ -n "$TIMEOUT" ]; then
+      bash "$0" dispatch "$WORKDIR" "$BUDGET" "$MODEL" "$LABEL" "$TASK" --timeout "$TIMEOUT" --batch-id "$batch_id" | tee -a "$tmp_handles"
+    else
+      bash "$0" dispatch "$WORKDIR" "$BUDGET" "$MODEL" "$LABEL" "$TASK" --batch-id "$batch_id" | tee -a "$tmp_handles"
+    fi
+    sleep 1
+  done < <(python3 - "$manifest" <<'PY'
+import base64, json, sys
+with open(sys.argv[1], encoding='utf-8') as f:
+    for line in f:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        print(base64.b64encode(line.encode()).decode())
+PY
+)
+
+  echo "==="
+  echo "{\"batch_id\": \"$batch_id\", \"manifest\": \"$manifest\", \"handles_file\": \"$tmp_handles\"}"
+}
 
 cmd_list() {
   local filter="${1:---all}"
-  
-  python3 -c "
-import json, glob, os
+  python3 - "$REGISTRY_DIR" "$filter" <<'PY'
+import json, glob, os, sys
+reg_dir, filt = sys.argv[1:3]
 tasks = []
-for f in glob.glob('$REGISTRY_DIR/*.json'):
+for f in glob.glob(os.path.join(reg_dir, '*.json')):
     try:
-        with open(f) as fh:
+        with open(f, encoding='utf-8') as fh:
             d = json.load(fh)
         tasks.append(d)
-    except: pass
-
+    except Exception:
+        pass
 tasks.sort(key=lambda x: x.get('updated_at', ''), reverse=True)
-
-filt = '$filter'
 if filt == '--running':
     tasks = [t for t in tasks if t.get('status') == 'running']
 elif filt == '--done':
     tasks = [t for t in tasks if t.get('status') == 'done']
 elif filt == '--failed':
-    tasks = [t for t in tasks if t.get('status') == 'failed']
-
+    tasks = [t for t in tasks if t.get('status') in ('failed','timeout')]
 if not tasks:
     print('No tasks found.')
 else:
-    for t in tasks[:20]:
-        sid = t.get('session_id', '')[:12]
-        cost = t.get('cost_usd', 0)
-        print(f'{t.get(\"status\",\"?\"):8} | {t.get(\"task_id\",\"?\"):40} | \${cost:.3f} | {t.get(\"label\",\"\")} | sid:{sid}')
-"
+    for t in tasks[:30]:
+        sid = (t.get('session_id') or '')[:12]
+        cost = t.get('cost_usd', 0) or 0
+        extra = f" batch:{t.get('batch_id')}" if t.get('batch_id') else ''
+        print(f"{t.get('status','?'):8} | {t.get('task_id','?'):40} | ${cost:.3f} | {t.get('label','')} | sid:{sid}{extra}")
+PY
 }
-
-# ─── cancel ───
 
 cmd_cancel() {
   local task_id="${1:-}"
   if [ -z "$task_id" ]; then echo '{"error": "No task_id"}' >&2; exit 1; fi
-  
   local reg_file="$REGISTRY_DIR/${task_id}.json"
-  if [ ! -f "$reg_file" ]; then
-    echo "{\"error\": \"Task not found: $task_id\"}"
-    exit 1
-  fi
-  
-  local pid=$(python3 -c "import json; print(json.load(open('$reg_file')).get('pid', ''))")
-  
+  [ -f "$reg_file" ] || { echo "{\"error\": \"Task not found: $task_id\"}"; exit 1; }
+
+  local pid
+  pid=$(python3 -c "import json; print(json.load(open('$reg_file')).get('pid', ''))")
   if [ -n "$pid" ]; then
     kill -TERM "$pid" 2>/dev/null && echo "Killed PID $pid" || echo "PID $pid not running"
-    # Also kill any child claude processes
     pkill -P "$pid" 2>/dev/null || true
   fi
-  
   write_registry "$task_id" "cancelled" "" "" "" "" "" "" "0" ""
   echo "{\"task_id\": \"$task_id\", \"status\": \"cancelled\"}"
 }
 
-# ─── costs ───
-
 cmd_costs() {
   local filter="${1:---today}"
-  
   if [ ! -f "$COST_LOG" ]; then
     echo "No cost data yet."
     exit 0
   fi
-  
-  python3 -c "
+  python3 - "$COST_LOG" "$filter" <<'PY'
 import json, sys
-from datetime import datetime, timedelta
-
+from datetime import datetime
+cost_log, filt = sys.argv[1:3]
 entries = []
-with open('$COST_LOG') as f:
+with open(cost_log, encoding='utf-8') as f:
     for line in f:
         line = line.strip()
-        if line:
-            try:
-                entries.append(json.loads(line))
-            except: pass
-
-filt = '$filter'
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except Exception:
+            pass
 if filt == '--today':
     today = datetime.now().strftime('%Y-%m-%d')
     entries = [e for e in entries if e.get('ts', '').startswith(today)]
-
 total = sum(e.get('cost_usd', 0) for e in entries)
 by_model = {}
 for e in entries:
     m = e.get('model', 'unknown')
     by_model[m] = by_model.get(m, 0) + e.get('cost_usd', 0)
-
 print(f'Tasks: {len(entries)}')
-print(f'Total cost: \${total:.4f}')
-print(f'By model:')
+print(f'Total cost: ${total:.4f}')
+print('By model:')
 for m, c in sorted(by_model.items(), key=lambda x: -x[1]):
-    print(f'  {m}: \${c:.4f}')
-print(f'By task:')
+    print(f'  {m}: ${c:.4f}')
+print('By task:')
 for e in entries[-10:]:
-    print(f'  {e.get(\"task_id\",\"?\"):40} | \${e.get(\"cost_usd\",0):.4f} | {e.get(\"status\",\"?\")}')
-"
+    print(f"  {e.get('task_id','?'):40} | ${e.get('cost_usd',0):.4f} | {e.get('status','?')}")
+PY
 }
 
-# ─── cleanup ───
-
 cmd_cleanup() {
-  # Archive completed tasks older than 48h
   local count=0
   for f in "$REGISTRY_DIR"/*.json; do
     [ -f "$f" ] || continue
     local age=$(( ($(date +%s) - $(stat -c %Y "$f")) / 3600 ))
     if [ "$age" -gt 48 ]; then
-      local status=$(python3 -c "import json; print(json.load(open('$f')).get('status', ''))" 2>/dev/null)
-      if [ "$status" = "done" ] || [ "$status" = "failed" ] || [ "$status" = "cancelled" ]; then
+      local status
+      status=$(python3 -c "import json; print(json.load(open('$f')).get('status', ''))" 2>/dev/null)
+      if [ "$status" = "done" ] || [ "$status" = "failed" ] || [ "$status" = "cancelled" ] || [ "$status" = "timeout" ]; then
         rm -f "$f"
         count=$((count + 1))
       fi
     fi
   done
-  
-  # Clean old output logs
-  find "$LOGS_DIR" -name "*.out" -mmin +2880 -delete 2>/dev/null
-  find "$RESULTS_DIR" -name "*.json" -mmin +2880 -delete 2>/dev/null
-  
+  find "$LOGS_DIR" -name "*.out" -mmin +2880 -delete 2>/dev/null || true
+  find "$LOGS_DIR" -name "*.stream" -mmin +2880 -delete 2>/dev/null || true
+  find "$LOGS_DIR" -name "*.stderr" -mmin +2880 -delete 2>/dev/null || true
+  find "$RESULTS_DIR" -name "*.json" -mmin +2880 -delete 2>/dev/null || true
+  find "$HOOKS_DIR" -type f -mmin +2880 -delete 2>/dev/null || true
   echo "Cleaned $count old registry entries and old logs/results"
 }
-
-# ─── main ───
 
 CMD="${1:-}"
 shift || true
@@ -444,8 +671,10 @@ shift || true
 case "$CMD" in
   dispatch) cmd_dispatch "$@" ;;
   poll)     cmd_poll "$@" ;;
+  watch)    cmd_watch "$@" ;;
   result)   cmd_result "$@" ;;
   resume)   cmd_resume "$@" ;;
+  batch)    cmd_batch "$@" ;;
   list)     cmd_list "$@" ;;
   cancel)   cmd_cancel "$@" ;;
   costs)    cmd_costs "$@" ;;
@@ -454,13 +683,15 @@ case "$CMD" in
     echo "Claude Code Orchestrator"
     echo ""
     echo "Commands:"
-    echo "  dispatch <workdir> <budget> <model> <label> \"<task>\"  — Submit task"
-    echo "  poll <task-id>                                         — Check status"
-    echo "  result <task-id>                                       — Get full output"
-    echo "  resume <task-id> <budget> \"<follow-up>\"               — Continue/correct"
-    echo "  list [--running|--done|--failed|--all]                 — List tasks"
-    echo "  cancel <task-id>                                       — Kill running task"
-    echo "  costs [--today|--all]                                  — Cost summary"
-    echo "  cleanup                                                — Remove old data"
+    echo "  dispatch <workdir> <budget> <model> <label> \"<task>\" [--timeout N] [--notify-cmd CMD]"
+    echo "  poll <task-id>"
+    echo "  watch <task-id>"
+    echo "  result [--text|--raw] <task-id>"
+    echo "  resume <task-id> <budget> \"<follow-up>\" [--timeout N] [--notify-cmd CMD]"
+    echo "  batch <manifest.jsonl> [--max-parallel N]"
+    echo "  list [--running|--done|--failed|--all]"
+    echo "  cancel <task-id>"
+    echo "  costs [--today|--all]"
+    echo "  cleanup"
     ;;
 esac
