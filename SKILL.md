@@ -165,6 +165,67 @@ $CC list --running
 | Session resume | Not supported | Full resume via `--resume` |
 | Cost tracking | Gateway usage logs | JSON output `cost_usd` field |
 
+## Default Operating Mode (recommended)
+
+**Do not treat Claude Code as a one-shot "research + write + finalize everything" agent by default.**
+
+Use this pattern unless the task is trivially small:
+
+### Phase A — Scout / Recon
+Create exactly one bounded reconnaissance artifact.
+
+Artifact should contain only:
+- key signals
+- constraints
+- ranked next step
+- exact downstream write target
+- minimum files Phase B should use
+
+### Phase B — Bounded Write
+Run a second Claude Code task that uses only:
+- the Phase A artifact
+- the minimum local truth files
+- one explicit output target
+
+### Phase C — Verify
+Before calling the task done:
+- confirm the target file exists on disk
+- confirm it is non-trivial (not tiny / empty)
+- skim the artifact directly instead of trusting status output alone
+
+## When to use this default pattern
+
+Use **Scout -> Bound -> Write -> Verify** for:
+- research briefs
+- triage reports
+- prompt packs
+- implementation scripts
+- cover/composition briefs
+- content-ops planning artifacts
+
+Avoid one-shot end-to-end runs for:
+- large ambiguous content tasks
+- tasks that require both broad exploration and exact final output
+- unattended shipping without file verification
+
+## Resume guidance
+
+`resume` is useful, but it is a **fallback**, not the default operating mode.
+
+Prefer:
+- a fresh bounded write step after reconnaissance
+- `resume` only when the original session clearly has useful context worth preserving
+- checking that `session_id` is present before depending on a resume-heavy workflow
+
+## Verification rule
+
+For this tool, **done means verified**, not just "Claude said it's done."
+
+Treat a task as successful only when:
+- the expected file exists
+- the file content is materially useful
+- the artifact matches the requested output target
+
 ## Security Notes
 
 - Claude Code has full filesystem access within its working directory
