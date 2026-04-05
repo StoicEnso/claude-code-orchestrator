@@ -421,15 +421,21 @@ cmd_resume() {
     exit 1
   fi
 
-  local session_id label workdir model batch_id
-  session_id=$(python3 -c "import json; print(json.load(open('$reg_file')).get('session_id', ''))")
-  label=$(python3 -c "import json; print(json.load(open('$reg_file')).get('label', 'resume'))")
-  workdir=$(python3 -c "import json; print(json.load(open('$reg_file')).get('workdir', ''))")
-  model=$(python3 -c "import json; print(json.load(open('$reg_file')).get('model', ''))")
-  batch_id=$(python3 -c "import json; print(json.load(open('$reg_file')).get('batch_id', ''))")
+  local session_id label workdir model batch_id attempts=0
+  while [ "$attempts" -lt 10 ]; do
+    refresh_from_output_if_ready "$task_id" >/dev/null 2>&1 || true
+    session_id=$(python3 -c "import json; print(json.load(open('$reg_file')).get('session_id', ''))" 2>/dev/null || true)
+    label=$(python3 -c "import json; print(json.load(open('$reg_file')).get('label', 'resume'))" 2>/dev/null || true)
+    workdir=$(python3 -c "import json; print(json.load(open('$reg_file')).get('workdir', ''))" 2>/dev/null || true)
+    model=$(python3 -c "import json; print(json.load(open('$reg_file')).get('model', ''))" 2>/dev/null || true)
+    batch_id=$(python3 -c "import json; print(json.load(open('$reg_file')).get('batch_id', ''))" 2>/dev/null || true)
+    [ -n "$session_id" ] && break
+    attempts=$((attempts + 1))
+    sleep 1
+  done
 
   if [ -z "$session_id" ]; then
-    echo "{\"error\": \"No session_id found for task $task_id — cannot resume\"}"
+    echo "{\"error\": \"No session_id found for task $task_id after waiting — cannot resume\"}"
     exit 1
   fi
 
