@@ -28,13 +28,25 @@ If Claude Code needs auth, run `claude` interactively once to complete the login
 
 ## Orchestrator
 
-**Path:** `{baseDir}/scripts/cc-orchestrator.sh`
+**Paths:**
+- Direct orchestrator: `{baseDir}/scripts/cc-orchestrator.sh`
+- Profile wrapper: `{baseDir}/scripts/cc-profile.sh`
+- Profiles config: `{baseDir}/profiles.json`
+
+Use the **profile wrapper** when an agent should summon Claude Code with the right workspace roots and shared directories already allowed.
 
 ### dispatch — Submit a task (returns immediately)
 
 ```bash
 {baseDir}/scripts/cc-orchestrator.sh dispatch <workdir> <budget> <model> <label> "<task>"
 ```
+
+Recommended options for active lanes:
+- `--expect-file <path>`
+- `--expect-min-bytes <n>`
+- `--next-action "<what should happen next>"`
+- `--continuation-mode continue|switch|blocked`
+- `--notify-cmd "bash {baseDir}/scripts/notify-openclaw.sh <agent-id> <session-id> <lane-label>"`
 
 - **workdir**: Directory Claude Code works in (scopes file access)
 - **budget**: Max spend in USD (e.g. `1.00`)
@@ -124,6 +136,24 @@ $CC poll "$TASK_ID"
 $CC resume "$TASK_ID" 0.50 "Also add unit tests for the new code"
 ```
 
+### Pattern 1B: Agent profile dispatch (recommended for Karim/Zara/Henry)
+
+```bash
+# Karim profile: KDP workspace + shared skills/process + kdp-books
+bash {baseDir}/scripts/cc-profile.sh karim dispatch 0.75 sonnet foster-recon "Create a bounded recon artifact for the active book lane" \
+  --expect-file /root/clawd/kdp-books/foster-carer-record-book/research/cc-recon-brief.md \
+  --expect-min-bytes 300 \
+  --next-action "run bounded Phase B write" \
+  --continuation-mode continue
+
+# Zara profile: Landscapio workspace + live site repo + shared skills/process
+bash {baseDir}/scripts/cc-profile.sh zara dispatch 0.75 sonnet article-phasea "Create a bounded recon artifact for the active article lane" \
+  --expect-file /data/landscapio-ceo/reports/ARTICLE_PHASEA.md \
+  --expect-min-bytes 300 \
+  --next-action "run bounded Phase B write" \
+  --continuation-mode continue
+```
+
 ### Pattern 2: Inline with exec (OpenClaw agents)
 
 ```bash
@@ -192,6 +222,22 @@ Before calling the task done:
 - confirm the target file exists on disk
 - confirm it is non-trivial (not tiny / empty)
 - skim the artifact directly instead of trusting status output alone
+- make a same-turn continuation decision: `continue | switch | blocked`
+
+## Callback / continuation bridge
+
+To mimic normal OpenClaw subagent behavior more closely, use a callback on every active-lane run.
+
+Recommended pattern:
+- dispatch with `--expect-file`, `--expect-min-bytes`, `--next-action`, `--continuation-mode`
+- add `--notify-cmd` using `scripts/notify-openclaw.sh`
+- when possible, use `scripts/cc-profile.sh <profile> dispatch ...` so Claude Code gets the right extra directories via `--add-dir`
+- when the callback lands back in the parent session, the parent must in the same turn choose exactly one of:
+  - continue
+  - switch
+  - blocked
+
+A verified artifact without a continuation decision is **not done**.
 
 ## When to use this default pattern
 

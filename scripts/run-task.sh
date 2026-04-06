@@ -122,7 +122,17 @@ run_claude_stream() {
   local stderr_file="$6"
   local timeout_secs="$7"
 
-  local -a cmd=(claude --print --output-format stream-json --verbose --max-budget-usd "$budget" --model "$model" -p "$task")
+  local -a cmd=(claude --print --output-format stream-json --verbose --max-budget-usd "$budget" --model "$model")
+  if [ -n "${CC_ADD_DIRS:-}" ]; then
+    IFS=':' read -r -a add_dirs <<< "$CC_ADD_DIRS"
+    for d in "${add_dirs[@]}"; do
+      [ -n "$d" ] && cmd+=(--add-dir "$d")
+    done
+  fi
+  if [ -n "${CC_APPEND_SYSTEM_PROMPT:-}" ]; then
+    cmd+=(--append-system-prompt "$CC_APPEND_SYSTEM_PROMPT")
+  fi
+  cmd+=(-p "$task")
 
   cd "$workdir"
   if [ "$timeout_secs" != "0" ] && [ -n "$timeout_secs" ]; then
@@ -140,7 +150,17 @@ resume_claude_stream() {
   local stderr_file="$5"
   local timeout_secs="$6"
 
-  local -a cmd=(claude --print --output-format stream-json --verbose --max-budget-usd "$budget" --resume "$session_id" -p "$task")
+  local -a cmd=(claude --print --output-format stream-json --verbose --max-budget-usd "$budget")
+  if [ -n "${CC_ADD_DIRS:-}" ]; then
+    IFS=':' read -r -a add_dirs <<< "$CC_ADD_DIRS"
+    for d in "${add_dirs[@]}"; do
+      [ -n "$d" ] && cmd+=(--add-dir "$d")
+    done
+  fi
+  if [ -n "${CC_APPEND_SYSTEM_PROMPT:-}" ]; then
+    cmd+=(--append-system-prompt "$CC_APPEND_SYSTEM_PROMPT")
+  fi
+  cmd+=(--resume "$session_id" -p "$task")
 
   if [ "$timeout_secs" != "0" ] && [ -n "$timeout_secs" ]; then
     timeout --signal=TERM "$timeout_secs" "${cmd[@]}" > "$stream_file" 2> "$stderr_file"

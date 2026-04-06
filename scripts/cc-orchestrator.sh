@@ -50,15 +50,22 @@ write_registry() {
   local timeout_secs="${11:-0}"
   local notify_cmd="${12:-}"
   local batch_id="${13:-}"
+  local expected_file="${14:-}"
+  local expect_min_bytes="${15:-0}"
+  local next_action="${16:-}"
+  local continuation_mode="${17:-}"
 
-  local label_json preview_json notify_json
+  local label_json preview_json notify_json expected_file_json next_action_json continuation_mode_json
   label_json=$(printf '%s' "$label" | json_escape)
   preview_json=$(printf '%s' "$result_preview" | json_escape)
   notify_json=$(printf '%s' "$notify_cmd" | json_escape)
+  expected_file_json=$(printf '%s' "$expected_file" | json_escape)
+  next_action_json=$(printf '%s' "$next_action" | json_escape)
+  continuation_mode_json=$(printf '%s' "$continuation_mode" | json_escape)
 
-  python3 - "$REGISTRY_DIR/$task_id.json" "$task_id" "$status" "$session_id" "$workdir" "$model" "$budget" "$pid" "$cost" "$timeout_secs" "$batch_id" "$label_json" "$preview_json" "$notify_json" <<'PY'
+  python3 - "$REGISTRY_DIR/$task_id.json" "$task_id" "$status" "$session_id" "$workdir" "$model" "$budget" "$pid" "$cost" "$timeout_secs" "$batch_id" "$label_json" "$preview_json" "$notify_json" "$expected_file_json" "$expect_min_bytes" "$next_action_json" "$continuation_mode_json" <<'PY'
 import json, os, sys, time
-reg_file, task_id, status, session_id, workdir, model, budget, pid, cost, timeout_secs, batch_id, label_json, preview_json, notify_json = sys.argv[1:15]
+reg_file, task_id, status, session_id, workdir, model, budget, pid, cost, timeout_secs, batch_id, label_json, preview_json, notify_json, expected_file_json, expect_min_bytes, next_action_json, continuation_mode_json = sys.argv[1:19]
 entry = {
     'task_id': task_id,
     'status': status,
@@ -73,6 +80,11 @@ entry = {
     'timeout_secs': int(timeout_secs) if timeout_secs else 0,
     'notify_cmd': json.loads(notify_json),
     'batch_id': batch_id,
+    'expected_file': json.loads(expected_file_json),
+    'expect_min_bytes': int(expect_min_bytes) if expect_min_bytes else 0,
+    'next_action': json.loads(next_action_json),
+    'continuation_mode': json.loads(continuation_mode_json),
+    'verified': False,
     'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
     'started_at': time.strftime('%Y-%m-%dT%H:%M:%S%z') if status == 'running' else ''
 }
@@ -88,6 +100,34 @@ entry['status'] = status
 entry['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
 with open(reg_file, 'w', encoding='utf-8') as f:
     json.dump(entry, f, indent=2)
+PY
+}
+
+
+verify_expected_artifact() {
+  local reg_file="$1"
+  python3 - "$reg_file" <<'PY'
+import json, os, sys
+reg_file=sys.argv[1]
+with open(reg_file, encoding='utf-8') as f:
+    reg=json.load(f)
+expected=reg.get('expected_file','')
+min_bytes=int(reg.get('expect_min_bytes',0) or 0)
+exists=False
+size=0
+verified=True
+if expected:
+    exists=os.path.exists(expected)
+    size=os.path.getsize(expected) if exists else 0
+    verified=exists and size >= min_bytes
+reg['expected_file_exists']=exists
+reg['expected_file_bytes']=size
+reg['verified']=verified
+if reg.get('status')=='done' and not verified:
+    reg['status']='incomplete'
+with open(reg_file, 'w', encoding='utf-8') as f:
+    json.dump(reg, f, indent=2)
+print(json.dumps(reg))
 PY
 }
 
@@ -179,18 +219,32 @@ run_notify_hook() {
   local reg_file="$REGISTRY_DIR/${task_id}.json"
   [ -f "$reg_file" ] || return 0
 
-  local notify_cmd status result_preview cost
+  local notify_cmd status result_preview cost expected_file expected_exists expected_bytes verified next_action continuation_mode session_id
   notify_cmd=$(python3 -c "import json; print(json.load(open('$reg_file')).get('notify_cmd',''))" 2>/dev/null || true)
   [ -n "$notify_cmd" ] || return 0
 
   status=$(python3 -c "import json; print(json.load(open('$reg_file')).get('status',''))" 2>/dev/null || true)
   result_preview=$(python3 -c "import json; print(json.load(open('$reg_file')).get('result_preview',''))" 2>/dev/null || true)
   cost=$(python3 -c "import json; print(json.load(open('$reg_file')).get('cost_usd',0))" 2>/dev/null || true)
+  expected_file=$(python3 -c "import json; print(json.load(open('$reg_file')).get('expected_file',''))" 2>/dev/null || true)
+  expected_exists=$(python3 -c "import json; print(json.load(open('$reg_file')).get('expected_file_exists',False))" 2>/dev/null || true)
+  expected_bytes=$(python3 -c "import json; print(json.load(open('$reg_file')).get('expected_file_bytes',0))" 2>/dev/null || true)
+  verified=$(python3 -c "import json; print(json.load(open('$reg_file')).get('verified',False))" 2>/dev/null || true)
+  next_action=$(python3 -c "import json; print(json.load(open('$reg_file')).get('next_action',''))" 2>/dev/null || true)
+  continuation_mode=$(python3 -c "import json; print(json.load(open('$reg_file')).get('continuation_mode',''))" 2>/dev/null || true)
+  session_id=$(python3 -c "import json; print(json.load(open('$reg_file')).get('session_id',''))" 2>/dev/null || true)
 
   CC_NOTIFY_TASK_ID="$task_id" \
   CC_NOTIFY_STATUS="$status" \
   CC_NOTIFY_COST_USD="$cost" \
   CC_NOTIFY_RESULT_PREVIEW="$result_preview" \
+  CC_NOTIFY_EXPECTED_FILE="$expected_file" \
+  CC_NOTIFY_EXPECTED_FILE_EXISTS="$expected_exists" \
+  CC_NOTIFY_EXPECTED_FILE_BYTES="$expected_bytes" \
+  CC_NOTIFY_VERIFIED="$verified" \
+  CC_NOTIFY_NEXT_ACTION="$next_action" \
+  CC_NOTIFY_CONTINUATION_MODE="$continuation_mode" \
+  CC_NOTIFY_SESSION_ID="$session_id" \
   bash -lc "$notify_cmd" > "$HOOKS_DIR/${task_id}.notify.out" 2> "$HOOKS_DIR/${task_id}.notify.err" || true
 }
 
@@ -238,6 +292,7 @@ with open(cost_log, 'a', encoding='utf-8') as f:
     }) + '\n')
 PY
   fi
+  verify_expected_artifact "$reg_file" >/dev/null 2>&1 || true
   run_notify_hook "$task_id"
 }
 
@@ -251,6 +306,10 @@ cmd_dispatch() {
 
   local timeout_secs="0"
   local notify_cmd=""
+  local expected_file=""
+  local expect_min_bytes="0"
+  local next_action=""
+  local continuation_mode=""
   local batch_id=""
 
   while [ "$#" -gt 0 ]; do
@@ -258,19 +317,23 @@ cmd_dispatch() {
       --timeout) timeout_secs="${2:-0}"; shift 2 ;;
       --notify-cmd) notify_cmd="${2:-}"; shift 2 ;;
       --batch-id) batch_id="${2:-}"; shift 2 ;;
+      --expect-file) expected_file="${2:-}"; shift 2 ;;
+      --expect-min-bytes) expect_min_bytes="${2:-0}"; shift 2 ;;
+      --next-action) next_action="${2:-}"; shift 2 ;;
+      --continuation-mode) continuation_mode="${2:-}"; shift 2 ;;
       *) echo "{\"error\": \"Unknown option: $1\"}" >&2; exit 1 ;;
     esac
   done
 
   if [ -z "$task" ]; then
     echo '{"error": "No task provided"}' >&2
-    echo "Usage: cc-orchestrator.sh dispatch <workdir> <budget> <model> <label> \"<task>\" [--timeout N] [--notify-cmd CMD]" >&2
+    echo "Usage: cc-orchestrator.sh dispatch <workdir> <budget> <model> <label> \"<task>\" [--timeout N] [--notify-cmd CMD] [--expect-file PATH] [--expect-min-bytes N] [--next-action TEXT] [--continuation-mode continue|switch|blocked]" >&2
     exit 1
   fi
 
   local task_id
   task_id=$(gen_task_id "$label")
-  write_registry "$task_id" "running" "" "$label" "$workdir" "$model" "$budget" "" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id"
+  write_registry "$task_id" "running" "" "$label" "$workdir" "$model" "$budget" "" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id" "$expected_file" "$expect_min_bytes" "$next_action" "$continuation_mode"
 
   (
     CC_TASK_ID="$task_id" \
@@ -283,9 +346,9 @@ cmd_dispatch() {
   ) &
 
   local bg_pid=$!
-  write_registry "$task_id" "running" "" "$label" "$workdir" "$model" "$budget" "$bg_pid" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id"
+  write_registry "$task_id" "running" "" "$label" "$workdir" "$model" "$budget" "$bg_pid" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id" "$expected_file" "$expect_min_bytes" "$next_action" "$continuation_mode"
 
-  echo "{\"task_id\": \"$task_id\", \"pid\": $bg_pid, \"status\": \"dispatched\", \"label\": \"$label\", \"model\": \"$model\", \"budget\": \"$budget\", \"timeout_secs\": $timeout_secs}"
+  echo "{\"task_id\": \"$task_id\", \"pid\": $bg_pid, \"status\": \"dispatched\", \"label\": \"$label\", \"model\": \"$model\", \"budget\": \"$budget\", \"timeout_secs\": $timeout_secs, \"expected_file\": \"$expected_file\", \"next_action\": \"$next_action\", \"continuation_mode\": \"$continuation_mode\"}"
 }
 
 cmd_poll() {
@@ -401,11 +464,19 @@ cmd_resume() {
 
   local timeout_secs="0"
   local notify_cmd=""
+  local expected_file=""
+  local expect_min_bytes="0"
+  local next_action=""
+  local continuation_mode=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --timeout) timeout_secs="${2:-0}"; shift 2 ;;
       --notify-cmd) notify_cmd="${2:-}"; shift 2 ;;
+      --expect-file) expected_file="${2:-}"; shift 2 ;;
+      --expect-min-bytes) expect_min_bytes="${2:-0}"; shift 2 ;;
+      --next-action) next_action="${2:-}"; shift 2 ;;
+      --continuation-mode) continuation_mode="${2:-}"; shift 2 ;;
       *) echo "{\"error\": \"Unknown option: $1\"}" >&2; exit 1 ;;
     esac
   done
@@ -440,7 +511,7 @@ cmd_resume() {
   fi
 
   local resume_id="${task_id}-r$(date +%s)"
-  write_registry "$resume_id" "running" "$session_id" "${label}-resume" "$workdir" "$model" "$budget" "" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id"
+  write_registry "$resume_id" "running" "$session_id" "${label}-resume" "$workdir" "$model" "$budget" "" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id" "$expected_file" "$expect_min_bytes" "$next_action" "$continuation_mode"
 
   (
     CC_TASK_ID="$resume_id" \
@@ -483,13 +554,14 @@ with open(cost_log, 'a', encoding='utf-8') as f:
         'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z')
     }) + '\n')
 PY
+    verify_expected_artifact "$REGISTRY_DIR/${resume_id}.json" >/dev/null 2>&1 || true
     run_notify_hook "$resume_id"
   ) &
 
   local bg_pid=$!
-  write_registry "$resume_id" "running" "$session_id" "${label}-resume" "$workdir" "$model" "$budget" "$bg_pid" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id"
+  write_registry "$resume_id" "running" "$session_id" "${label}-resume" "$workdir" "$model" "$budget" "$bg_pid" "0" "" "$timeout_secs" "$notify_cmd" "$batch_id" "$expected_file" "$expect_min_bytes" "$next_action" "$continuation_mode"
 
-  echo "{\"task_id\": \"$resume_id\", \"resumed_from\": \"$task_id\", \"session_id\": \"$session_id\", \"pid\": $bg_pid, \"status\": \"dispatched\", \"timeout_secs\": $timeout_secs}"
+  echo "{\"task_id\": \"$resume_id\", \"resumed_from\": \"$task_id\", \"session_id\": \"$session_id\", \"pid\": $bg_pid, \"status\": \"dispatched\", \"timeout_secs\": $timeout_secs, \"expected_file\": \"$expected_file\", \"next_action\": \"$next_action\", \"continuation_mode\": \"$continuation_mode\"}"
 }
 
 cmd_batch() {
@@ -689,11 +761,11 @@ case "$CMD" in
     echo "Claude Code Orchestrator"
     echo ""
     echo "Commands:"
-    echo "  dispatch <workdir> <budget> <model> <label> \"<task>\" [--timeout N] [--notify-cmd CMD]"
+    echo "  dispatch <workdir> <budget> <model> <label> \"<task>\" [--timeout N] [--notify-cmd CMD] [--expect-file PATH] [--expect-min-bytes N] [--next-action TEXT] [--continuation-mode continue|switch|blocked]"
     echo "  poll <task-id>"
     echo "  watch <task-id>"
     echo "  result [--text|--raw] <task-id>"
-    echo "  resume <task-id> <budget> \"<follow-up>\" [--timeout N] [--notify-cmd CMD]"
+    echo "  resume <task-id> <budget> \"<follow-up>\" [--timeout N] [--notify-cmd CMD] [--expect-file PATH] [--expect-min-bytes N] [--next-action TEXT] [--continuation-mode continue|switch|blocked]"
     echo "  batch <manifest.jsonl> [--max-parallel N]"
     echo "  list [--running|--done|--failed|--all]"
     echo "  cancel <task-id>"

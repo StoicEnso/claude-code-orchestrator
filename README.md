@@ -436,6 +436,24 @@ Change these to a persistent path (e.g., `~/.local/share/cc-orchestrator/`) if y
 
 ---
 
+
+## Workspace Profiles
+
+The repo now includes `scripts/cc-profile.sh` plus `profiles.json` so agents can summon Claude Code with the right workspace roots and shared directories already allowed via `--add-dir`.
+
+Examples:
+```bash
+bash scripts/cc-profile.sh karim env
+bash scripts/cc-profile.sh karim dispatch 0.75 sonnet foster-recon "Create a bounded recon artifact"   --expect-file /root/clawd/kdp-books/foster-carer-record-book/research/cc-recon-brief.md   --expect-min-bytes 300   --next-action "run bounded Phase B write"   --continuation-mode continue
+```
+
+Default bundled profiles:
+- `main`
+- `karim`
+- `zara`
+
+This lets each agent keep its own working directory while still giving Claude Code access to shared skills/process roots where appropriate.
+
 ## Cost Guide
 
 Approximate costs per task based on Claude API pricing (subject to change):

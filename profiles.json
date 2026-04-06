@@ -1,0 +1,34 @@
+{
+  "main": {
+    "workdir": "/root/clawd",
+    "add_dirs": [
+      "/root/clawd/skills",
+      "/root/clawd/process",
+      "/root/clawd/vault",
+      "/root/clawd/docs"
+    ],
+    "notes": "Henry main profile: full clawd workspace plus skills/process/docs."
+  },
+  "karim": {
+    "workdir": "/root/kdp-ceo",
+    "add_dirs": [
+      "/root/kdp-ceo",
+      "/root/clawd/skills",
+      "/root/clawd/process",
+      "/root/clawd/vault",
+      "/root/clawd/kdp-books"
+    ],
+    "notes": "Karim profile: KDP workspace plus shared skills/process and KDP book workspace."
+  },
+  "zara": {
+    "workdir": "/root/landscapio-ceo",
+    "add_dirs": [
+      "/root/landscapio-ceo",
+      "/data/clawd/LandscapeDesignAi",
+      "/root/clawd/skills",
+      "/root/clawd/process",
+      "/root/clawd/vault"
+    ],
+    "notes": "Zara profile: Landscapio operator workspace plus live site repo and shared skills/process."
+  }
+}
