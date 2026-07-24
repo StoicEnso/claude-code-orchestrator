@@ -1,281 +1,60 @@
 ---
-name: claude-code-orchestrator
-description: "Delegate tasks to Claude Code as a subagent via shell scripts. Use when: need Claude/Anthropic model access for complex coding, multi-file refactoring, PR creation, or when OpenClaw's Anthropic provider is unavailable. Also use when: spawning background coding tasks, parallel task execution, or multi-turn coding sessions with corrections. Don't use when: task is a simple file edit (use edit tool), quick shell command (use exec), or when gpt-5.4/sonnet via OpenClaw can handle it directly."
-metadata:
-  openclaw:
-    emoji: "🔧"
-    requires:
-      bins: ["claude", "python3"]
+name: claude-delegate
+description: "Give Claude back to OpenClaw through a local Claude Code delegation lane with dispatch, poll, result, resume, and an optional non-root bypassPermissions runner. Use when: you want Claude subscription access available to OpenClaw agents through a stable local worker lane, need resume/monitoring in a bounded workspace, or need Claude auth separate from OpenClaw providers. Don't use when: the user explicitly wants an ACP chat harness or thread, use acp-router plus sessions_spawn(runtime: \"acp\"); the task is a simple edit or shell command, use edit/exec directly; or the local Claude runner is not set up yet, read references/setup.md first."
 ---
 
-# Claude Code Orchestrator
+# Claude Delegate
 
-Delegate tasks to Claude Code (installed locally) as a pseudo-subagent. Claude Code uses its own Anthropic API auth (Claude Code subscription), independent of OpenClaw's provider config.
+Give Claude back to OpenClaw.
 
-## Setup (one-time)
+Use this skill when Claude Code should run as a **local delegated worker**, not as an ACP chat harness.
 
-If Claude Code is not installed:
-```bash
-# Install Claude Code
-npm install -g @anthropic-ai/claude-code
+The whole point is simple: third-party harnesses do not reliably get Claude subscription access, but OpenClaw operators still want Claude-quality work inside their agent system.
 
-# Verify
-claude --version
-claude --print -p "Say hello"
-```
+## Stable entrypoints
 
-If Claude Code needs auth, run `claude` interactively once to complete the login flow.
+- Wrapper: `scripts/claude-delegate.sh`
+- Profile wrapper: `scripts/cc-profile.sh`
+- Orchestrator: `scripts/cc-orchestrator.sh`
+- Low-level runner: `scripts/run-task.sh`
 
-## Orchestrator
+## Default flow
 
-**Paths:**
-- Direct orchestrator: `{baseDir}/scripts/cc-orchestrator.sh`
-- Profile wrapper: `{baseDir}/scripts/cc-profile.sh`
-- Profiles config: `{baseDir}/profiles.json`
+1. Read `references/setup.md` the first time you install or port this skill.
+2. Configure `profiles.json`, or point `CLAUDE_DELEGATE_PROFILES` at a host-local profiles file.
+3. Keep local delegate instructions in the nearest `CLAUDE.delegate.md` files. The wrapper now tells Claude to discover/read those plus nearby `AGENTS.md`, `TOOLS.md`, and `README.md` docs before substantive work.
+4. Dispatch work through `scripts/claude-delegate.sh dispatch <profile> <budget|none> <model> <label> "<task>"`. Use `none` for the normal no-hard-dollar-cap path; numeric budgets are only for deliberately bounded probes.
+5. Monitor with `poll`, `result`, `list`, or `doctor`.
+6. Use `resume` to continue the same Claude session instead of starting over.
 
-Use the **profile wrapper** when an agent should summon Claude Code with the right workspace roots and shared directories already allowed.
+### Dispatch detachment guard
 
-### dispatch — Submit a task (returns immediately)
+`dispatch` / `resume` run the Claude worker as a detached background job. A short outer OpenClaw `exec` timeout on the dispatch command must not kill the worker. If `poll` reports `failed-interrupted` with `worker_pid_dead_before_result`, inspect `/tmp/claude-subagent-logs/<task-id>.stream` before concluding Claude never started: a stream `system/init` event means the session exists and may be resumable even when the registry has no `.out` result.
 
-```bash
-{baseDir}/scripts/cc-orchestrator.sh dispatch <workdir> <budget> <model> <label> "<task>"
-```
+### Budget multiplier
 
-Recommended options for active lanes:
-- `--expect-file <path>`
-- `--expect-min-bytes <n>`
-- `--next-action "<what should happen next>"`
-- `--continuation-mode continue|switch|blocked`
-- `--notify-cmd "bash {baseDir}/scripts/notify-openclaw.sh <agent-id> <session-id> <lane-label>"`
+The stable workspace wrapper `/root/clawd/tools/claude-delegate.sh` sets `CLAUDE_DELEGATE_BUDGET_MULTIPLIER=5` by default, so numeric per-task caps are increased 5x before reaching Claude (for example `0.45` → `2.25`, `0.55` → `2.75`). Use `none` for no cap, or prefix a deliberate tiny probe with `CLAUDE_DELEGATE_BUDGET_MULTIPLIER=1` when you really want the literal number.
 
-- **workdir**: Directory Claude Code works in (scopes file access)
-- **budget**: Max spend in USD (e.g. `1.00`)
-- **model**: `sonnet` (default), `opus` (strongest), `haiku` (cheapest)
-- **label**: Human-readable name for tracking
-- **task**: The task description
+## When to prefer this over ACP
 
-Returns JSON with `task_id` and `pid`. Task runs in background.
+In this workspace, this skill is now the **default Claude path**.
 
-### poll — Check task status
+Prefer this skill when you want:
+- a boring local wrapper around Claude CLI
+- a non-root runner user with synced auth/binary state
+- bounded filesystem access through a chosen workdir
+- cheap monitoring and resume without a chat-thread harness
 
-```bash
-{baseDir}/scripts/cc-orchestrator.sh poll <task-id>
-```
+Claude ACP is disabled for normal workspace use here, so do not route routine Claude work through ACP.
 
-Returns JSON with `status` (running/done/failed), `cost_usd`, `session_id`, `result_preview`.
+## Files to load when needed
 
-### result — Get full output
+- Setup, auth, env knobs, and profile customization: `references/setup.md`
+- Delegate bootstrap guidance for this skill: `CLAUDE.delegate.md`
 
-```bash
-{baseDir}/scripts/cc-orchestrator.sh result <task-id>
-```
+## Notes
 
-Returns the complete structured JSON output from Claude Code.
-
-### resume — Continue or correct a previous task
-
-```bash
-{baseDir}/scripts/cc-orchestrator.sh resume <task-id> <budget> "<follow-up>"
-```
-
-Claude Code reloads the **full conversation history** from the session and continues. Use for:
-- Corrections: "actually, change X to Y"
-- Multi-step work: "now implement step 2"
-- Review: "explain what you changed and why"
-
-### list — View all tasks
-
-```bash
-{baseDir}/scripts/cc-orchestrator.sh list [--running|--done|--failed|--all]
-```
-
-### cancel — Kill a running task
-
-```bash
-{baseDir}/scripts/cc-orchestrator.sh cancel <task-id>
-```
-
-### costs — Cost summary
-
-```bash
-{baseDir}/scripts/cc-orchestrator.sh costs [--today|--all]
-```
-
-### cleanup — Remove old data
-
-```bash
-{baseDir}/scripts/cc-orchestrator.sh cleanup
-```
-
-## Low-Level Script
-
-For direct execution without the orchestrator layer:
-
-```bash
-{baseDir}/scripts/run-task.sh run <workdir> <budget> <model> "<task>"
-{baseDir}/scripts/run-task.sh resume <session-id> <budget> "<follow-up>"
-{baseDir}/scripts/run-task.sh status [<session-id>]
-{baseDir}/scripts/run-task.sh clean
-```
-
-## Integration Patterns
-
-### Pattern 1: Background dispatch from any agent
-
-```bash
-CC="{baseDir}/scripts/cc-orchestrator.sh"
-
-# Dispatch (returns immediately)
-HANDLE=$($CC dispatch /path/to/project 1.00 sonnet "my-task" "Refactor the auth module")
-TASK_ID=$(echo "$HANDLE" | python3 -c "import json,sys; print(json.load(sys.stdin)['task_id'])")
-
-# Later: check status
-$CC poll "$TASK_ID"
-
-# If corrections needed:
-$CC resume "$TASK_ID" 0.50 "Also add unit tests for the new code"
-```
-
-### Pattern 1B: Agent profile dispatch (recommended for Karim/Zara/Henry)
-
-```bash
-# Karim profile: KDP workspace + shared skills/process + kdp-books
-bash {baseDir}/scripts/cc-profile.sh karim dispatch 0.75 sonnet foster-recon "Create a bounded recon artifact for the active book lane" \
-  --expect-file /root/clawd/kdp-books/foster-carer-record-book/research/cc-recon-brief.md \
-  --expect-min-bytes 300 \
-  --next-action "run bounded Phase B write" \
-  --continuation-mode continue
-
-# Zara profile: Landscapio workspace + live site repo + shared skills/process
-bash {baseDir}/scripts/cc-profile.sh zara dispatch 0.75 sonnet article-phasea "Create a bounded recon artifact for the active article lane" \
-  --expect-file /data/landscapio-ceo/reports/ARTICLE_PHASEA.md \
-  --expect-min-bytes 300 \
-  --next-action "run bounded Phase B write" \
-  --continuation-mode continue
-```
-
-### Pattern 2: Inline with exec (OpenClaw agents)
-
-```bash
-# Run in background via exec
-exec background:true command:"bash {baseDir}/scripts/cc-orchestrator.sh dispatch /root/project 1.00 sonnet label 'task' > /tmp/handle.json 2>&1"
-
-# Poll for completion
-exec command:"bash {baseDir}/scripts/cc-orchestrator.sh poll <task-id>"
-```
-
-### Pattern 3: Parallel tasks
-
-```bash
-CC="{baseDir}/scripts/cc-orchestrator.sh"
-$CC dispatch ./src 0.50 sonnet "lint" "Fix all ESLint errors"
-$CC dispatch ./src 0.50 sonnet "types" "Add TypeScript types to utils/"
-$CC dispatch ./docs 0.50 haiku "docs" "Update the API docs"
-
-# Monitor all
-$CC list --running
-```
-
-## Cost Guide
-
-| Model | Typical cost per task | Best for |
-|-------|----------------------|----------|
-| `haiku` | $0.01-0.05 | Simple file reads, quick checks |
-| `sonnet` | $0.05-0.20 | Most subagent work, coding, analysis |
-| `opus` | $0.15-0.50 | Complex reasoning, multi-file refactors |
-
-## Key Differences from OpenClaw Subagents
-
-| | OpenClaw subagent | Claude Code subagent |
-|---|---|---|
-| Auth | OpenClaw API keys | Claude Code subscription |
-| Tools | sessions_send, cron, memory_search | Read, Write, Edit, Bash, WebFetch |
-| Context | Inherits AGENTS.md, SOUL.md | Only sees files in workdir |
-| Steering | `subagents steer` | `resume` with follow-up prompt |
-| Session resume | Not supported | Full resume via `--resume` |
-| Cost tracking | Gateway usage logs | JSON output `cost_usd` field |
-
-## Default Operating Mode (recommended)
-
-**Do not treat Claude Code as a one-shot "research + write + finalize everything" agent by default.**
-
-Use this pattern unless the task is trivially small:
-
-### Phase A — Scout / Recon
-Create exactly one bounded reconnaissance artifact.
-
-Artifact should contain only:
-- key signals
-- constraints
-- ranked next step
-- exact downstream write target
-- minimum files Phase B should use
-
-### Phase B — Bounded Write
-Run a second Claude Code task that uses only:
-- the Phase A artifact
-- the minimum local truth files
-- one explicit output target
-
-### Phase C — Verify
-Before calling the task done:
-- confirm the target file exists on disk
-- confirm it is non-trivial (not tiny / empty)
-- skim the artifact directly instead of trusting status output alone
-- make a same-turn continuation decision: `continue | switch | blocked`
-
-## Callback / continuation bridge
-
-To mimic normal OpenClaw subagent behavior more closely, use a callback on every active-lane run.
-
-Recommended pattern:
-- dispatch with `--expect-file`, `--expect-min-bytes`, `--next-action`, `--continuation-mode`
-- add `--notify-cmd` using `scripts/notify-openclaw.sh`
-- when possible, use `scripts/cc-profile.sh <profile> dispatch ...` so Claude Code gets the right extra directories via `--add-dir`
-- when the callback lands back in the parent session, the parent must in the same turn choose exactly one of:
-  - continue
-  - switch
-  - blocked
-
-A verified artifact without a continuation decision is **not done**.
-
-## When to use this default pattern
-
-Use **Scout -> Bound -> Write -> Verify** for:
-- research briefs
-- triage reports
-- prompt packs
-- implementation scripts
-- cover/composition briefs
-- content-ops planning artifacts
-
-Avoid one-shot end-to-end runs for:
-- large ambiguous content tasks
-- tasks that require both broad exploration and exact final output
-- unattended shipping without file verification
-
-## Resume guidance
-
-`resume` is useful, but it is a **fallback**, not the default operating mode.
-
-Prefer:
-- a fresh bounded write step after reconnaissance
-- `resume` only when the original session clearly has useful context worth preserving
-- checking that `session_id` is present before depending on a resume-heavy workflow
-
-## Verification rule
-
-For this tool, **done means verified**, not just "Claude said it's done."
-
-Treat a task as successful only when:
-- the expected file exists
-- the file content is materially useful
-- the artifact matches the requested output target
-
-## Security Notes
-
-- Claude Code has full filesystem access within its working directory
-- Always set an appropriate **workdir** to scope what Claude Code can see
-- Use budget caps to prevent runaway costs
-- Avoid pointing it at sensitive directories (credentials, configs)
-- Results stored in `/tmp/claude-subagent-results/` (auto-cleaned by `cleanup`)
+- `scripts/cc-profile.sh` supports `CLAUDE_DELEGATE_PROFILES=/abs/path/to/profiles.json`.
+- Profile paths support `~` and environment variable expansion.
+- `scripts/ensure-nonroot-delegation.sh` supports env overrides for source paths if your Claude or acpx installs live somewhere else.
+- Delegate bootstrap is on by default. Disable with `CLAUDE_DELEGATE_BOOTSTRAP=0` or change the instruction filename with `CLAUDE_DELEGATE_DOC_BASENAME`.

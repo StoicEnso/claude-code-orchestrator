@@ -22,6 +22,49 @@ CHECK_ONLY="${1:-}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ERRORS=0
 
+default_runner_user=""
+if [ "$(id -u)" = "0" ] && id ccbot >/dev/null 2>&1 && [ -d /home/ccbot ]; then
+  default_runner_user="ccbot"
+fi
+
+export CLAUDE_RUNNER_USER="${CLAUDE_RUNNER_USER:-$default_runner_user}"
+if [ -n "$CLAUDE_RUNNER_USER" ]; then
+  export CLAUDE_RUNNER_HOME="${CLAUDE_RUNNER_HOME:-/home/$CLAUDE_RUNNER_USER}"
+  export CLAUDE_BIN="${CLAUDE_BIN:-$CLAUDE_RUNNER_HOME/.local/bin/claude}"
+else
+  export CLAUDE_RUNNER_HOME="${CLAUDE_RUNNER_HOME:-$HOME}"
+  export CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+fi
+export CLAUDE_PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-bypassPermissions}"
+export CLAUDE_BACKEND="${CLAUDE_BACKEND:-cli}"
+export CLAUDE_DELEGATE_PROFILES="${CLAUDE_DELEGATE_PROFILES:-${SCRIPT_DIR%/scripts}/profiles.json}"
+export CLAUDE_DELEGATE_BOOTSTRAP="${CLAUDE_DELEGATE_BOOTSTRAP:-1}"
+export CLAUDE_DELEGATE_DOC_BASENAME="${CLAUDE_DELEGATE_DOC_BASENAME:-CLAUDE.delegate.md}"
+default_oauth_env="$HOME/.claude/.oauth-token.env"
+if [ "$(id -u)" = "0" ] && [ -f /root/.claude/.oauth-token.env ]; then
+  default_oauth_env="/root/.claude/.oauth-token.env"
+fi
+export CLAUDE_OAUTH_ENV_FILE="${CLAUDE_OAUTH_ENV_FILE:-$default_oauth_env}"
+
+if [ -f "$CLAUDE_OAUTH_ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CLAUDE_OAUTH_ENV_FILE"
+fi
+
+build_runner_cmd() {
+  local -a cmd
+  if [ -n "${CLAUDE_RUNNER_USER:-}" ]; then
+    cmd=(sudo -u "$CLAUDE_RUNNER_USER" -H env HOME="$CLAUDE_RUNNER_HOME")
+  else
+    cmd=(env HOME="$CLAUDE_RUNNER_HOME")
+  fi
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    cmd+=(CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN")
+  fi
+  cmd+=("${CLAUDE_BIN:-claude}")
+  RUNNER_CMD=("${cmd[@]}")
+}
+
 ok()   { echo -e "${GREEN}✓${NC} $1"; }
 warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 fail() { echo -e "${RED}✗${NC} $1"; ERRORS=$((ERRORS + 1)); }
@@ -32,8 +75,8 @@ echo ""
 
 # 1. Check claude CLI
 echo "Dependencies:"
-if command -v claude &>/dev/null; then
-  VERSION=$(claude --version 2>&1 | head -1)
+if [ -x "$CLAUDE_BIN" ] || command -v claude &>/dev/null; then
+  VERSION=$({ "$CLAUDE_BIN" --version 2>/dev/null || claude --version 2>&1; } | head -1)
   ok "claude CLI found: $VERSION"
 else
   fail "claude CLI not found. Install: npm install -g @anthropic-ai/claude-code"
@@ -75,10 +118,11 @@ done
 # 5. Check claude auth (quick test)
 echo ""
 echo "Authentication:"
-if command -v claude &>/dev/null; then
-  AUTH_TEST=$(echo "respond with only the word 'authenticated'" | timeout 30 claude --print 2>&1 || true)
+if [ -x "$CLAUDE_BIN" ] || command -v claude &>/dev/null; then
+  build_runner_cmd
+  AUTH_TEST=$(timeout 30 "${RUNNER_CMD[@]}" --print "respond with only the word 'authenticated'" 2>&1 || true)
   if echo "$AUTH_TEST" | grep -qi "authenticated"; then
-    ok "Claude Code authenticated and responding"
+    ok "Claude Code authenticated and responding via runner"
   elif echo "$AUTH_TEST" | grep -qi "error\|unauthorized\|login\|expired"; then
     fail "Claude Code auth issue. Run 'claude' interactively to re-authenticate."
   else
@@ -112,7 +156,7 @@ if [ $ERRORS -eq 0 ]; then
   ok "Setup complete! All checks passed."
   echo ""
   echo "Quick start:"
-  echo "  $SCRIPT_DIR/cc-orchestrator.sh dispatch /tmp 0.50 sonnet my-first-task \"List all files in the current directory\""
+  echo "  $SCRIPT_DIR/cc-orchestrator.sh dispatch /tmp none sonnet my-first-task \"List all files in the current directory\""
 else
   fail "$ERRORS check(s) failed. Fix the issues above and re-run."
   exit 1

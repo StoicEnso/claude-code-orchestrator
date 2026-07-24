@@ -1,15 +1,15 @@
 #!/bin/bash
 # Claude Code profile wrapper
 # Usage:
-#   cc-profile.sh <profile> dispatch <budget> <model> <label> "<task>" [extra cc-orchestrator options]
-#   cc-profile.sh <profile> resume <task-id> <budget> "<follow-up>" [extra cc-orchestrator options]
+#   cc-profile.sh <profile> dispatch <budget|none> <model> <label> "<task>" [extra cc-orchestrator options]
+#   cc-profile.sh <profile> resume <task-id> <budget|none> "<follow-up>" [extra cc-orchestrator options]
 #   cc-profile.sh <profile> env
 # Profiles are defined in ../profiles.json
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROFILES_JSON="${SCRIPT_DIR%/scripts}/profiles.json"
+PROFILES_JSON="${CLAUDE_DELEGATE_PROFILES:-${SCRIPT_DIR%/scripts}/profiles.json}"
 CC_ORCH="$SCRIPT_DIR/cc-orchestrator.sh"
 
 PROFILE="${1:-}"
@@ -23,15 +23,21 @@ fi
 
 read_profile() {
   python3 - "$PROFILES_JSON" "$PROFILE" <<'PY'
-import json, sys, shlex
+import json, os, sys, shlex
 p, profile = sys.argv[1:3]
 with open(p, encoding='utf-8') as f:
     j = json.load(f)
 if profile not in j:
     raise SystemExit(f'Unknown profile: {profile}')
 prof = j[profile]
-print('WORKDIR=' + shlex.quote(prof['workdir']))
-print('CC_ADD_DIRS=' + shlex.quote(':'.join(prof.get('add_dirs', []))))
+
+def norm(path: str) -> str:
+    return os.path.expanduser(os.path.expandvars(path))
+
+workdir = norm(prof['workdir'])
+add_dirs = [norm(d) for d in prof.get('add_dirs', [])]
+print('WORKDIR=' + shlex.quote(workdir))
+print('CC_ADD_DIRS=' + shlex.quote(':'.join(add_dirs)))
 print('PROFILE_NOTES=' + shlex.quote(prof.get('notes', '')))
 PY
 }
@@ -46,7 +52,7 @@ case "$CMD" in
     echo "PROFILE_NOTES=$PROFILE_NOTES"
     ;;
   dispatch)
-    BUDGET="${1:-1.00}"
+    BUDGET="${1:-none}"
     MODEL="${2:-sonnet}"
     LABEL="${3:-task}"
     TASK="${4:-}"
@@ -56,7 +62,7 @@ case "$CMD" in
     ;;
   resume)
     TASK_ID="${1:-}"
-    BUDGET="${2:-0.50}"
+    BUDGET="${2:-none}"
     FOLLOW_UP="${3:-}"
     shift 3 || true
     [ -n "$TASK_ID" ] && [ -n "$FOLLOW_UP" ] || { echo "Need task-id and follow-up" >&2; exit 1; }

@@ -1,4 +1,9 @@
 {
+  "scratch": {
+    "workdir": "/tmp",
+    "add_dirs": [],
+    "notes": "Safe default scratch profile for smoke tests and one-off tasks."
+  },
   "main": {
     "workdir": "/root/clawd",
     "add_dirs": [
@@ -30,5 +35,12 @@
       "/root/clawd/vault"
     ],
     "notes": "Zara profile: Landscapio operator workspace plus live site repo and shared skills/process."
+  },
+  "workspace": {
+    "workdir": "/root/clawd",
+    "add_dirs": [
+      "/root/clawd"
+    ],
+    "notes": "Generic Henry workspace profile for local Claude Delegate tasks."
   }
 }
